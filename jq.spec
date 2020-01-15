@@ -1,12 +1,12 @@
 Name:           jq
 Version:        1.5
-Release:        14
+Release:        15
 Summary:        A lightweight and flexible command-line JSON processor
 License:        MIT and ASL 2.0 and CC-BY and GPLv3
 URL:            http://stedolan.github.io/jq/
 Source0:        https://github.com/stedolan/jq/releases/download/jq-%{version}/jq-%{version}.tar.gz
 Patch0:         CVE-2015-8863.patch
-BuildRequires:  flex bison oniguruma-devel valgrind
+BuildRequires:  flex bison valgrind
 
 %description
 jq is a lightweight and flexible command-line JSON processor.
@@ -68,5 +68,8 @@ make check
 
 
 %changelog
-* Tue Dec 31 2019 zhujunhao <zhujunhao5@huawei.com> 1.5-14
+* Wed Jan 15 2020 openEuler Buildteam <buildteam@openeuler.org> - 1.5-15
+- Delete unndeeded build requires
+
+* Tue Dec 31 2019 zhujunhao <zhujunhao5@huawei.com> - 1.5-14
 - Package init
