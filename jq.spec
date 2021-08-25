@@ -1,13 +1,11 @@
 Name:           jq
-Version:        1.5
-Release:        18
+Version:        1.6
+Release:        1
 Summary:        A lightweight and flexible command-line JSON processor
 License:        MIT and ASL 2.0 and CC-BY and GPLv3
 URL:            http://stedolan.github.io/jq/
 Source0:        https://github.com/stedolan/jq/releases/download/jq-%{version}/jq-%{version}.tar.gz
-Patch0:         CVE-2015-8863.patch
-Patch1:         CVE-2016-4074.patch
-BuildRequires:  make flex bison valgrind gcc
+BuildRequires:  make flex bison valgrind gcc chrpath oniguruma-devel
 
 %description
 jq is a lightweight and flexible command-line JSON processor.
@@ -39,6 +37,7 @@ Documentation for jq package.
 %install
 %make_install
 %delete_la
+chrpath -d %{buildroot}%{_bindir}/%{name}
 
 %check
 %if %{?_with_check:1}%{!?_with_check:0}
@@ -71,6 +70,9 @@ make check
 
 
 %changelog
+* Wed Aug 25 2021 wangyue <wangyue92@huawei.com> - 1.6-1
+- Upgrade to 1.6
+
 * Thu Jun 03 2021 wulei <wulei80@huawei.com> - 1.5-18
 - fixes failed: no acceptable C compiler found in $PATH
 
