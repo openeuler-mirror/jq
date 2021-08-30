@@ -1,0 +1,616 @@
+From b2384ea878f484c48419fc0ec30380d0a5ffe3ce Mon Sep 17 00:00:00 2001
+From: Max Zerzouri <maxdamantus@gmail.com>
+Date: Sat, 15 May 2021 08:32:27 +0000
+Subject: [PATCH] Binary strings: preserve UTF-8 and UTF-16 errors
+
+The internal string representation is changed from UTF-8 with replacement
+characters to a modified form of "WTF-8" that is able to distinctly encode
+UTF-8 errors and UTF-16 errors.
+
+This handles UTF-8 errors in raw string inputs and handles UTF-8 and UTF-16
+errors in JSON input. UTF-16 errors (using "\uXXXX") and UTF-8 errors (using
+the original raw bytes) are maintained when emitting JSON. When emitting raw
+strings, UTF-8 errors are maintained and UTF-16 errors are converted into
+replacement characters.
+---
+ scripts/gen_utf8_tables.py |  3 +-
+ src/jv.c                   | 28 ++++++------
+ src/jv.h                   |  1 +
+ src/jv_parse.c             | 77 ++++++++++++++++++++++-----------
+ src/jv_print.c             | 26 +++++++++++-
+ src/jv_unicode.c           | 87 ++++++++++++++++++++++++++++++++++----
+ src/jv_unicode.h           | 11 +++++
+ src/jv_utf8_tables.h       |  4 +-
+ src/main.c                 | 29 ++++++++++++-
+ tests/jq.test              |  5 +++
+ tests/shtest               |  9 ++++
+ 11 files changed, 228 insertions(+), 52 deletions(-)
+
+diff --git a/scripts/gen_utf8_tables.py b/scripts/gen_utf8_tables.py
+index 6fe0a53..7706462 100644
+--- a/scripts/gen_utf8_tables.py
++++ b/scripts/gen_utf8_tables.py
+@@ -16,8 +16,7 @@ def print_table(type, name, t):
+ def utf8info(c):
+     if c < 0x80: return 1, mask(7)
+     if 0x80 <= c <= 0xBF: return 255, mask(6)
+-    if 0xC0 <= c <= 0xC1: return 0, 0
+-    if 0xC2 <= c <= 0xDF: return 2, mask(5)
++    if 0xC0 <= c <= 0xDF: return 2, mask(5)
+     if 0xE0 <= c <= 0xEF: return 3, mask(4)
+     if 0xF0 <= c <= 0xF4: return 4, mask(3)
+     if 0xF4 <= c <= 0xFF: return 0, 0
+diff --git a/src/jv.c b/src/jv.c
+index 1f1029e..e979cc6 100644
+--- a/src/jv.c
++++ b/src/jv.c
+@@ -452,20 +452,24 @@ static jvp_string* jvp_string_alloc(uint32_t size) {
+   return s;
+ }
+ 
+-/* Copy a UTF8 string, replacing all badly encoded points with U+FFFD */
++/* Copy a UTF8 string, using WTF-8b to replace all UTF-8 errors */
+ static jv jvp_string_copy_replace_bad(const char* data, uint32_t length) {
+   const char* end = data + length;
+   const char* i = data;
+   const char* cstart;
+ 
+-  uint32_t maxlength = length * 3 + 1; // worst case: all bad bytes, each becomes a 3-byte U+FFFD
++  uint32_t maxlength = length * 2 + 1; // worst case: all bad bytes, each becomes a 2-byte overlong U+XX
+   jvp_string* s = jvp_string_alloc(maxlength);
+   char* out = s->data;
+   int c = 0;
+ 
+-  while ((i = jvp_utf8_next((cstart = i), end, &c))) {
++  while ((i = jvp_utf8_extended_next((cstart = i), end, 0, &c))) {
+     if (c == -1) {
+-      c = 0xFFFD; // U+FFFD REPLACEMENT CHARACTER
++      int error = (unsigned char)*cstart;
++      assert(error >= 0x80 && error <= 0xFF);
++      c = -error;
++      /* Ensure each UTF-8 error byte is consumed separately */
++      i = cstart + 1;
+     }
+     out += jvp_utf8_encode(c, out);
+     assert(out < s->data + maxlength);
+@@ -477,8 +481,8 @@ static jv jvp_string_copy_replace_bad(const char* data, uint32_t length) {
+   return r;
+ }
+ 
+-/* Assumes valid UTF8 */
+-static jv jvp_string_new(const char* data, uint32_t length) {
++/* Assumes valid WTF-8b */
++jv jv_string_extended_sized(const char* data, int length) {
+   jvp_string* s = jvp_string_alloc(length);
+   s->length_hashed = length << 1;
+   if (data != NULL)
+@@ -618,7 +622,7 @@ static int jvp_string_equal(jv a, jv b) {
+ jv jv_string_sized(const char* str, int len) {
+   return
+     jvp_utf8_is_valid(str, str+len) ?
+-    jvp_string_new(str, len) :
++    jv_string_extended_sized(str, len) :
+     jvp_string_copy_replace_bad(str, len);
+ }
+ 
+@@ -682,14 +686,14 @@ jv jv_string_split(jv j, jv sep) {
+ 
+   if (seplen == 0) {
+     int c;
+-    while ((jstr = jvp_utf8_next(jstr, jend, &c)))
++    while ((jstr = jvp_utf8_extended_next(jstr, jend, JVP_UTF8_ERRORS_ALL, &c)))
+       a = jv_array_append(a, jv_string_append_codepoint(jv_string(""), c));
+   } else {
+     for (p = jstr; p < jend; p = s + seplen) {
+       s = _jq_memmem(p, jend - p, sepstr, seplen);
+       if (s == NULL)
+         s = jend;
+-      a = jv_array_append(a, jv_string_sized(p, s - p));
++      a = jv_array_append(a, jv_string_extended_sized(p, s - p));
+       // Add an empty string to denote that j ends on a sep
+       if (s + seplen == jend && seplen != 0)
+         a = jv_array_append(a, jv_string(""));
+@@ -760,7 +764,7 @@ jv jv_string_slice(jv j, int start, int end) {
+ 
+   /* Look for byte offset corresponding to start codepoints */
+   for (p = s, i = 0; i < start; i++) {
+-    p = jvp_utf8_next(p, s + len, &c);
++    p = jvp_utf8_extended_next(p, s + len, JVP_UTF8_ERRORS_ALL, &c);
+     if (p == NULL) {
+       jv_free(j);
+       return jv_string_empty(16);
+@@ -772,7 +776,7 @@ jv jv_string_slice(jv j, int start, int end) {
+   }
+   /* Look for byte offset corresponding to end codepoints */
+   for (e = p; e != NULL && i < end; i++) {
+-    e = jvp_utf8_next(e, s + len, &c);
++    e = jvp_utf8_extended_next(e, s + len, JVP_UTF8_ERRORS_ALL, &c);
+     if (e == NULL) {
+       e = s + len;
+       break;
+@@ -790,7 +794,7 @@ jv jv_string_slice(jv j, int start, int end) {
+    * memory like a drunken navy programmer.  There's probably nothing we
+    * can do about it.
+    */
+-  res = jv_string_sized(p, e - p);
++  res = jv_string_extended_sized(p, e - p);
+   jv_free(j);
+   return res;
+ }
+diff --git a/src/jv.h b/src/jv.h
+index d111c80..2aed1ae 100644
+--- a/src/jv.h
++++ b/src/jv.h
+@@ -104,6 +104,7 @@ jv jv_array_indexes(jv, jv);
+ 
+ jv jv_string(const char*);
+ jv jv_string_sized(const char*, int);
++jv jv_string_extended_sized(const char*, int);
+ jv jv_string_empty(int len);
+ int jv_string_length_bytes(jv);
+ int jv_string_length_codepoints(jv);
+diff --git a/src/jv_parse.c b/src/jv_parse.c
+index 51ad9f0..194efaf 100644
+--- a/src/jv_parse.c
++++ b/src/jv_parse.c
+@@ -397,7 +397,7 @@ static void tokenadd(struct jv_parser* p, char c) {
+   p->tokenbuf[p->tokenpos++] = c;
+ }
+ 
+-static int unhex4(char* hex) {
++static int unhex4(const char* hex) {
+   int r = 0;
+   for (int i=0; i<4; i++) {
+     char c = *hex++;
+@@ -413,15 +413,19 @@ static int unhex4(char* hex) {
+ }
+ 
+ static pfunc found_string(struct jv_parser* p) {
+-  char* in = p->tokenbuf;
+-  char* out = p->tokenbuf;
+-  char* end = p->tokenbuf + p->tokenpos;
+-
+-  while (in < end) {
+-    char c = *in++;
++  const char* in = p->tokenbuf;
++  // start by writing to tokenbuf, only allocate in case that output size is greater than input size (possible only when input has UTF-8 errors)
++  char* newbuf = NULL;
++  char* buf = p->tokenbuf;
++  char* out = buf;
++  const char* end = p->tokenbuf + p->tokenpos;
++  const char* cstart;
++  int c;
++
++  while ((in = jvp_utf8_extended_next((cstart = in), end, 0, &c))) {
+     if (c == '\\') {
+       if (in >= end)
+-        return "Expected escape character at end of string";
++        return jv_mem_free(newbuf), "Expected escape character at end of string";
+       c = *in++;
+       switch (c) {
+       case '\\':
+@@ -436,38 +440,61 @@ static pfunc found_string(struct jv_parser* p) {
+       case 'u':
+         /* ahh, the complicated case */
+         if (in + 4 > end)
+-          return "Invalid \\uXXXX escape";
++          return jv_mem_free(newbuf), "Invalid \\uXXXX escape";
+         int hexvalue = unhex4(in);
+         if (hexvalue < 0)
+-          return "Invalid characters in \\uXXXX escape";
++          return jv_mem_free(newbuf), "Invalid characters in \\uXXXX escape";
+         unsigned long codepoint = (unsigned long)hexvalue;
+         in += 4;
++        // leading surrogate
+         if (0xD800 <= codepoint && codepoint <= 0xDBFF) {
+-          /* who thought UTF-16 surrogate pairs were a good idea? */
+-          if (in + 6 > end || in[0] != '\\' || in[1] != 'u')
+-            return "Invalid \\uXXXX\\uXXXX surrogate pair escape";
+-          unsigned long surrogate = unhex4(in+2);
+-          if (!(0xDC00 <= surrogate && surrogate <= 0xDFFF))
+-            return "Invalid \\uXXXX\\uXXXX surrogate pair escape";
+-          in += 6;
+-          codepoint = 0x10000 + (((codepoint - 0xD800) << 10)
+-                                 |(surrogate - 0xDC00));
++          // look ahead for trailing surrogate and decode as UTF-16, otherwise encode this lone surrogate as WTF-8
++          if (in + 6 <= end && in[0] == '\\' && in[1] == 'u') {
++            unsigned long surrogate = unhex4(in+2);
++            if (0xDC00 <= surrogate && surrogate <= 0xDFFF) {
++              in += 6;
++              codepoint = 0x10000 + (((codepoint - 0xD800) << 10)
++                                     |(surrogate - 0xDC00));
++            }
++          }
+         }
+-        if (codepoint > 0x10FFFF)
+-          codepoint = 0xFFFD; // U+FFFD REPLACEMENT CHARACTER
++        // UTF-16 surrogates can not encode a greater codepoint
++        assert(codepoint <= 0x10FFFF);
++        // NOTE: a leading or trailing surrogate here (0xD800 <= codepoint && codepoint <= 0xDFFF) is encoded as WTF-8
+         out += jvp_utf8_encode(codepoint, out);
+         break;
+ 
+       default:
+-        return "Invalid escape";
++        return jv_mem_free(newbuf), "Invalid escape";
+       }
+     } else {
+       if (c > 0 && c < 0x001f)
+-        return "Invalid string: control characters from U+0000 through U+001F must be escaped";
+-      *out++ = c;
++        return jv_mem_free(newbuf), "Invalid string: control characters from U+0000 through U+001F must be escaped";
++      if (c == -1) {
++        int error = (unsigned char)*cstart;
++        assert(error >= 0x80 && error <= 0xFF);
++        c = -error;
++        /* Ensure each UTF-8 error byte is consumed separately */
++        const int wtf8_length = 2;
++        assert(jvp_utf8_encode_length(c) == wtf8_length);
++        in = cstart + 1;
++        if (newbuf == NULL && out + wtf8_length > in) {
++          /* Output is about to overflow input, move output to temporary buffer */
++          int current_size = out - p->tokenbuf;
++          int remaining = end - cstart;
++          newbuf = jv_mem_alloc(current_size + remaining * wtf8_length); // worst case: all remaining bad bytes, each becomes a 2-byte overlong U+XX
++          memcpy(newbuf, buf, current_size);
++          buf = newbuf;
++          out = buf + current_size;
++        }
++      } else
++        assert(jvp_utf8_encode_length(c) == in - cstart);
++      out += jvp_utf8_encode(c, out);
+     }
+   }
+-  TRY(value(p, jv_string_sized(p->tokenbuf, out - p->tokenbuf)));
++  jv v = jv_string_extended_sized(buf, out - buf);
++  jv_mem_free(newbuf);
++  TRY(value(p, v));
+   p->tokenpos = 0;
+   return 0;
+ }
+diff --git a/src/jv_print.c b/src/jv_print.c
+index 5ebc01e..dfa1f05 100644
+--- a/src/jv_print.c
++++ b/src/jv_print.c
+@@ -98,6 +98,16 @@ static void put_char(char c, FILE* fout, jv* strout, int T) {
+   put_buf(&c, 1, fout, strout, T);
+ }
+ 
++static void put_invalid_utf8_byte(int c, FILE* fout, jv* strout, int T) {
++  assert(c >= 0x80 && c <= 0xFF);
++  if (strout) {
++    // encode as an invalid UTF-8 byte in output
++    *strout = jv_string_append_codepoint(*strout, -c);
++  } else {
++    put_char(c, fout, strout, T);
++  }
++}
++
+ static void put_str(const char* s, FILE* fout, jv* strout, int T) {
+   put_buf(s, strlen(s), fout, strout, T);
+ }
+@@ -121,7 +131,7 @@ static void jvp_dump_string(jv str, int ascii_only, FILE* F, jv* S, int T) {
+   int c = 0;
+   char buf[32];
+   put_char('"', F, S, T);
+-  while ((i = jvp_utf8_next((cstart = i), end, &c))) {
++  while ((i = jvp_utf8_extended_next((cstart = i), end, JVP_UTF8_ERRORS_ALL, &c))) {
+     assert(c != -1);
+     int unicode_escape = 0;
+     if (0x20 <= c && c <= 0x7E) {
+@@ -130,6 +140,17 @@ static void jvp_dump_string(jv str, int ascii_only, FILE* F, jv* S, int T) {
+         put_char('\\', F, S, T);
+       }
+       put_char(c, F, S, T);
++    } else if (c >= -0xFF && c <= -0x80) {
++      // Invalid UTF-8 byte
++      if (ascii_only) {
++        // refusing to emit invalid UTF-8
++        // TODO: convince the world to adopt a "\xXX" notation for JSON?
++        c = 0xFFFD; // U+FFFD REPLACEMENT CHARACTER
++        unicode_escape = 1;
++      } else {
++        // pass through
++        put_invalid_utf8_byte(-c, F, S, T);
++      }
+     } else if (c < 0x20 || c == 0x7F) {
+       // ASCII control character
+       switch (c) {
+@@ -160,6 +181,9 @@ static void jvp_dump_string(jv str, int ascii_only, FILE* F, jv* S, int T) {
+     } else {
+       if (ascii_only) {
+         unicode_escape = 1;
++      } else if (c >= 0xD800 && c <= 0xDFFF) {
++        // lone surrogate; can't be encoded to UTF-8
++        unicode_escape = 1;
+       } else {
+         put_buf(cstart, i - cstart, F, S, T);
+       }
+diff --git a/src/jv_unicode.c b/src/jv_unicode.c
+index d197349..8c47536 100644
+--- a/src/jv_unicode.c
++++ b/src/jv_unicode.c
+@@ -27,6 +27,56 @@ const char* jvp_utf8_backtrack(const char* start, const char* min, int *missing_
+ }
+ 
+ const char* jvp_utf8_next(const char* in, const char* end, int* codepoint_ret) {
++  return jvp_utf8_extended_next(in, end, JVP_UTF8_REPLACE, codepoint_ret);
++}
++
++/*
++  The internal representation of jv strings uses an encoding that is hereby
++  referred to as "WTF-8b" (until someone demonstrates use of another term to
++  refer to the same encoding).
++
++  WTF-8b is an extension of WTF-8, which is an extension of UTF-8. Any sequence
++  of Unicode scalar values is represented by the same bytes in UTF-8, WTF-8 and
++  WTF-8b, therefore any well-formed UTF-8 string is interpreted as the same
++  sequence of Unicode scalar values (roughly, code points) in WTF-8b.
++
++  Like WTF-8, WTF-8b is able to encode UTF-16 errors (lone surrogates) using
++  the "generalized UTF-8" representation of code points between U+D800 and
++  U+DFFF. These errors occur in JSON terms such as:
++    "_\uD8AB_\uDBCD_"
++
++  Unlike WTF-8, WTF-8b is also able to encode UTF-8 errors (bytes 0x80 to 0xFF
++  that are not part of a valid UTF-8 sequence) using the first 128 "overlong"
++  codings (unused 2-byte representations of U+00 to U+7F). These errors can
++  occur in any byte stream that is interpreted as UTF-8, for example:
++    "\xED\xA2\xAB"
++  The above example is in fact the WTF-8b (and WTF-8) encoding for the lone
++  UTF-16 surrogate "\uD8AB", which demonstrates the need for a distinct
++  encoding of UTF-8 errors. If a distinction were not made, then "\xED\xA2\xAB"
++  and "\uD8AB" would be interpreted as the same string, so at least one of the
++  forms would not be preserved when printed as JSON output.
++
++  It should also be noted that the process of converting from invalid UTF-8 to
++  WTF-8b is not (and can not be) idempotent, since the "generalised UTF-8"
++  representation of UTF-16 surrogates are intentionally not able to be
++  generated from invalid UTF-8, only through some other means (usually "\uXXXX"
++  notation).
++
++  Each UTF-16 error is encoded as 3 WTF-8b (or WTF-8) bytes.
++  Each UTF-8 error is encoded as 2 WTF-8b bytes.
++
++  When iterating over code points using `JVP_UTF8_ERRORS_UTF16`, encoded UTF-16
++  errors are emitted in the form of code points in the range U+D800 to U+DFFF.
++  These code points can be reencoded as usual using `jvp_utf8_encode`.
++
++  When iterating over code points using `JVP_UTF8_ERRORS_UTF8`, encoded UTF-8
++  errors are emitted in the form of code points in the negative range -0x80 to
++  -0xFF. These negative code points can be negated to determine the original
++  error bytes. These code points can be reencoded as usual using
++  `jvp_utf8_encode`.
++*/
++
++const char* jvp_utf8_extended_next(const char* in, const char* end, enum jvp_utf8_flags flags, int* codepoint_ret) {
+   assert(in <= end);
+   if (in == end) {
+     return 0;
+@@ -40,9 +90,11 @@ const char* jvp_utf8_next(const char* in, const char* end, int* codepoint_ret) {
+     length = 1;
+   } else if (length == 0 || length == UTF8_CONTINUATION_BYTE) {
+     /* Bad single byte - either an invalid byte or an out-of-place continuation byte */
++    if (flags & JVP_UTF8_ERRORS_ALL) assert(0 && "Invalid WTF-8b sequence: bad single byte");
+     length = 1;
+   } else if (in + length > end) {
+     /* String ends before UTF8 sequence ends */
++    if (flags & JVP_UTF8_ERRORS_ALL) assert(0 && "Invalid WTF-8b sequence: underrun");
+     length = end - in;
+   } else {
+     codepoint = ((unsigned)in[0]) & utf8_coding_bits[first];
+@@ -50,6 +102,7 @@ const char* jvp_utf8_next(const char* in, const char* end, int* codepoint_ret) {
+       unsigned ch = (unsigned char)in[i];
+       if (utf8_coding_length[ch] != UTF8_CONTINUATION_BYTE){
+         /* Invalid UTF8 sequence - not followed by the right number of continuation bytes */
++        if (flags & JVP_UTF8_ERRORS_ALL) assert(0 && "Invalid WTF-8b sequence: wrong bytes");
+         codepoint = -1;
+         length = i;
+         break;
+@@ -58,17 +111,29 @@ const char* jvp_utf8_next(const char* in, const char* end, int* codepoint_ret) {
+     }
+     if (codepoint < utf8_first_codepoint[length]) {
+       /* Overlong UTF8 sequence */
+-      codepoint = -1;
++      if ((flags & JVP_UTF8_ERRORS_UTF8) && 0x00 <= codepoint && codepoint <= 0x7F) {
++        /* UTF-8 error is emitted as a negative codepoint */
++        codepoint = -(codepoint + 0x80);
++      } else {
++        if (flags & JVP_UTF8_ERRORS_ALL) assert(0 && "Invalid WTF-8b sequence: overlong");
++        codepoint = -1;
++      }
+     }
+     if (0xD800 <= codepoint && codepoint <= 0xDFFF) {
+-      /* Surrogate codepoints can't be encoded in UTF8 */
+-      codepoint = -1;
++      /* Surrogate codepoints are allowed in WTF-8/WTF-8b */
++      if (!(flags & JVP_UTF8_ERRORS_UTF16)) {
++        /* Surrogate codepoints can't be encoded in UTF8 */
++        codepoint = -1;
++      }
+     }
+     if (codepoint > 0x10FFFF) {
+       /* Outside Unicode range */
++      if (flags & JVP_UTF8_ERRORS_ALL) assert(0 && "Invalid WTF-8b sequence: out of range");
+       codepoint = -1;
+     }
+   }
++  if (codepoint == -1 && (flags & JVP_UTF8_REPLACE))
++    codepoint = 0xFFFD; // U+FFFD REPLACEMENT CHARACTER
+   assert(length > 0);
+   *codepoint_ret = codepoint;
+   return in + length;
+@@ -76,7 +141,7 @@ const char* jvp_utf8_next(const char* in, const char* end, int* codepoint_ret) {
+ 
+ int jvp_utf8_is_valid(const char* in, const char* end) {
+   int codepoint;
+-  while ((in = jvp_utf8_next(in, end, &codepoint))) {
++  while ((in = jvp_utf8_extended_next(in, end, 0, &codepoint))) {
+     if (codepoint == -1) return 0;
+   }
+   return 1;
+@@ -91,20 +156,24 @@ int jvp_utf8_decode_length(char startchar) {
+ }
+ 
+ int jvp_utf8_encode_length(int codepoint) {
+-  if (codepoint <= 0x7F) return 1;
++  if (codepoint >= 0 && codepoint <= 0x7F) return 1;
+   else if (codepoint <= 0x7FF) return 2;
+   else if (codepoint <= 0xFFFF) return 3;
+   else return 4;
+ }
+ 
+ int jvp_utf8_encode(int codepoint, char* out) {
+-  assert(codepoint >= 0 && codepoint <= 0x10FFFF);
++  assert((codepoint >= 0 && codepoint <= 0x10FFFF) || (codepoint >= -0xFF && codepoint <= -0x80));
+   char* start = out;
+-  if (codepoint <= 0x7F) {
++  if (codepoint >= 0 && codepoint <= 0x7F) {
+     *out++ = codepoint;
+   } else if (codepoint <= 0x7FF) {
+-    *out++ = 0xC0 + ((codepoint & 0x7C0) >> 6);
+-    *out++ = 0x80 + ((codepoint & 0x03F));
++    // encode UTF-8 errors as overlong representations of U+00 to U+7F
++    int cp = codepoint >= -0xFF && codepoint <= -0x80?
++      -codepoint - 0x80 :
++      codepoint;
++    *out++ = 0xC0 + ((cp & 0x7C0) >> 6);
++    *out++ = 0x80 + ((cp & 0x03F));
+   } else if(codepoint <= 0xFFFF) {
+     *out++ = 0xE0 + ((codepoint & 0xF000) >> 12);
+     *out++ = 0x80 + ((codepoint & 0x0FC0) >> 6);
+diff --git a/src/jv_unicode.h b/src/jv_unicode.h
+index 558721a..37c7fc0 100644
+--- a/src/jv_unicode.h
++++ b/src/jv_unicode.h
+@@ -1,7 +1,18 @@
+ #ifndef JV_UNICODE_H
+ #define JV_UNICODE_H
+ 
++enum jvp_utf8_flags {
++  /* Emit replacement character instead of -1 for errors */
++  JVP_UTF8_REPLACE = 1,
++  /* Treat input as WTF-8b, emit 0xD800 to 0xDFFF to denote encoded UTF-16 errors */
++  JVP_UTF8_ERRORS_UTF16 = 2,
++  /* Treat input as WTF-8b, emit -0x80 to -0xFF to denote encoded UTF-8 errors */
++  JVP_UTF8_ERRORS_UTF8 = 4,
++  JVP_UTF8_ERRORS_ALL = JVP_UTF8_ERRORS_UTF16 | JVP_UTF8_ERRORS_UTF8
++};
++
+ const char* jvp_utf8_backtrack(const char* start, const char* min, int *missing_bytes);
++const char* jvp_utf8_extended_next(const char* in, const char* end, enum jvp_utf8_flags flags, int* codepoint);
+ const char* jvp_utf8_next(const char* in, const char* end, int* codepoint);
+ int jvp_utf8_is_valid(const char* in, const char* end);
+ 
+diff --git a/src/jv_utf8_tables.h b/src/jv_utf8_tables.h
+index f1a4252..7c68749 100644
+--- a/src/jv_utf8_tables.h
++++ b/src/jv_utf8_tables.h
+@@ -12,7 +12,7 @@ static const unsigned char utf8_coding_length[] =
+   0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+   0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+   0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+-  0x00, 0x00, 0x02, 0x02, 0x02, 0x02, 0x02, 0x02, 0x02, 0x02, 0x02, 0x02, 0x02, 0x02, 0x02, 0x02,
++  0x02, 0x02, 0x02, 0x02, 0x02, 0x02, 0x02, 0x02, 0x02, 0x02, 0x02, 0x02, 0x02, 0x02, 0x02, 0x02,
+   0x02, 0x02, 0x02, 0x02, 0x02, 0x02, 0x02, 0x02, 0x02, 0x02, 0x02, 0x02, 0x02, 0x02, 0x02, 0x02,
+   0x03, 0x03, 0x03, 0x03, 0x03, 0x03, 0x03, 0x03, 0x03, 0x03, 0x03, 0x03, 0x03, 0x03, 0x03, 0x03,
+   0x04, 0x04, 0x04, 0x04, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00};
+@@ -29,7 +29,7 @@ static const unsigned char utf8_coding_bits[] =
+   0x3f, 0x3f, 0x3f, 0x3f, 0x3f, 0x3f, 0x3f, 0x3f, 0x3f, 0x3f, 0x3f, 0x3f, 0x3f, 0x3f, 0x3f, 0x3f,
+   0x3f, 0x3f, 0x3f, 0x3f, 0x3f, 0x3f, 0x3f, 0x3f, 0x3f, 0x3f, 0x3f, 0x3f, 0x3f, 0x3f, 0x3f, 0x3f,
+   0x3f, 0x3f, 0x3f, 0x3f, 0x3f, 0x3f, 0x3f, 0x3f, 0x3f, 0x3f, 0x3f, 0x3f, 0x3f, 0x3f, 0x3f, 0x3f,
+-  0x00, 0x00, 0x1f, 0x1f, 0x1f, 0x1f, 0x1f, 0x1f, 0x1f, 0x1f, 0x1f, 0x1f, 0x1f, 0x1f, 0x1f, 0x1f,
++  0x1f, 0x1f, 0x1f, 0x1f, 0x1f, 0x1f, 0x1f, 0x1f, 0x1f, 0x1f, 0x1f, 0x1f, 0x1f, 0x1f, 0x1f, 0x1f,
+   0x1f, 0x1f, 0x1f, 0x1f, 0x1f, 0x1f, 0x1f, 0x1f, 0x1f, 0x1f, 0x1f, 0x1f, 0x1f, 0x1f, 0x1f, 0x1f,
+   0x0f, 0x0f, 0x0f, 0x0f, 0x0f, 0x0f, 0x0f, 0x0f, 0x0f, 0x0f, 0x0f, 0x0f, 0x0f, 0x0f, 0x0f, 0x0f,
+   0x07, 0x07, 0x07, 0x07, 0x07, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00};
+diff --git a/src/main.c b/src/main.c
+index b154689..5fa5c4f 100644
+--- a/src/main.c
++++ b/src/main.c
+@@ -30,6 +30,7 @@
+ #include "jv.h"
+ #include "jq.h"
+ #include "jv_alloc.h"
++#include "jv_unicode.h"
+ #include "util.h"
+ #include "src/version.h"
+ 
+@@ -161,6 +162,30 @@ static const char *skip_shebang(const char *p) {
+   return n+1;
+ }
+ 
++static void jvp_dump_raw_string(const char* start, const char* end, FILE* f) {
++  static const unsigned char UTF8_REPLACEMENT[] = {0xEF,0xBF,0xBD}; // U+FFFD REPLACEMENT CHARACTER
++
++  const char* i = start;
++  const char* cstart;
++  int c;
++
++  while ((i = jvp_utf8_extended_next((cstart = i), end, JVP_UTF8_ERRORS_ALL, &c))) {
++    if (c >= -0xFF && c <= -0x80) {
++      // invalid UTF-8 byte; pass through
++      fwrite(start, 1, cstart - start, f);
++      start = i;
++      fputc(-c, f);
++    } else if ((c >= 0xD800 && c <= 0xDFFF) || c == -1) {
++      // lone surrugate; can't be encoded to UTF-8
++      fwrite(start, 1, cstart - start, f);
++      start = i;
++      fwrite(UTF8_REPLACEMENT, 1, sizeof(UTF8_REPLACEMENT), f);
++    } else
++      continue;
++  }
++  fwrite(start, 1, end - start, f);
++}
++
+ static int process(jq_state *jq, jv value, int flags, int dumpopts) {
+   int ret = 14; // No valid results && -e -> exit(4)
+   jq_start(jq, value, flags);
+@@ -170,7 +195,9 @@ static int process(jq_state *jq, jv value, int flags, int dumpopts) {
+       if (options & ASCII_OUTPUT) {
+         jv_dumpf(result, stdout, JV_PRINT_ASCII);
+       } else {
+-        fwrite(jv_string_value(result), 1, jv_string_length_bytes(jv_copy(result)), stdout);
++        const char *start = jv_string_value(result);
++        const char *end = start + jv_string_length_bytes(jv_copy(result));
++        jvp_dump_raw_string(start, end, stdout);
+       }
+       ret = 0;
+       jv_free(result);
+diff --git a/tests/jq.test b/tests/jq.test
+index 7e2dd43..c882fd2 100644
+--- a/tests/jq.test
++++ b/tests/jq.test
+@@ -57,6 +57,11 @@ null
+ "Aa\r\n\t\b\f\u03bc"
+ "Aa\u000d\u000a\u0009\u0008\u000c\u03bc"
+ 
++# Check that unpaired surrogates are preserved in output
++"\u2200\ud800\u2203\udc00\u2205\udfff"
++null
++"∀\ud800∃\udc00∅\udfff"
++
+ "inter\("pol" + "ation")"
+ null
+ "interpolation"
+diff --git a/tests/shtest b/tests/shtest
+index 86fec33..4c8b57e 100755
+--- a/tests/shtest
++++ b/tests/shtest
+@@ -130,6 +130,15 @@ printf "[1,2][3,4]\n" | $JQ -cs add > $d/out 2>&1
+ cmp $d/out $d/expected
+ 
+ 
++clean=false
++# Invalid UTF-8 bytes are preserved when encoding/decoding JSON
++dd if=/dev/urandom bs=1024 count=1024 >$d/rand 2>/dev/null
++$VALGRIND $Q $JQ -sR . $d/rand >$d/out.json
++$VALGRIND $Q $JQ -j . $d/out.json >$d/out
++cmp $d/out $d/rand
++clean=true
++
++
+ ## Test streaming parser
+ 
+ ## If we add an option to stream to the `import ... as $symbol;` directive
