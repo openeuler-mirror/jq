@@ -1,0 +1,23 @@
+From e165542664e9fe3c155eeb13e16320a07dfbd5fd Mon Sep 17 00:00:00 2001
+From: Max Zerzouri <maxdamantus@gmail.com>
+Date: Sat, 15 May 2021 10:50:15 +0000
+Subject: [PATCH] jv_string_implode: avoid producing unprintable string from
+ reserved code points
+
+---
+ src/jv.c | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/src/jv.c b/src/jv.c
+index 979d188..1f1029e 100644
+--- a/src/jv.c
++++ b/src/jv.c
+@@ -725,7 +725,7 @@ jv jv_string_implode(jv j) {
+     jv n = jv_array_get(jv_copy(j), i);
+     assert(jv_get_kind(n) == JV_KIND_NUMBER);
+     int nv = jv_number_value(n);
+-    if (nv > 0x10FFFF)
++    if (nv < 0 || (nv >= 0xD800 && nv <= 0xDFFF) || nv > 0x10FFFF)
+       nv = 0xFFFD; // U+FFFD REPLACEMENT CHARACTER
+     s = jv_string_append_codepoint(s, nv);
+   }
