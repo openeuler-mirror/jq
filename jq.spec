@@ -1,11 +1,14 @@
 Name:           jq
 Version:        1.6
-Release:        2
+Release:        3
 Summary:        A lightweight and flexible command-line JSON processor
 License:        MIT and ASL 2.0 and CC-BY and GPLv3
 URL:            http://stedolan.github.io/jq/
 Source0:        https://github.com/stedolan/jq/releases/download/jq-%{version}/jq-%{version}.tar.gz
-BuildRequires:  make flex bison valgrind gcc chrpath oniguruma-devel
+BuildRequires:  make flex bison gcc chrpath oniguruma-devel
+%ifarch %{valgrind_arches}
+ BuildRequires: valgrind
+%endif
 
 Patch0001:      jv_string_implode-avoid-producing-unprintable-string-fromreserved-code-points.patch
 Patch0002:      Binary-strings-preserve-UTF-8-and-UTF-16-errors.patch
@@ -75,6 +78,9 @@ make check
 
 
 %changelog
+* Fri Sep 17 2021 sunhaoxiang <maxim2010@163.com> - 1.6-3
+- Modify the trigger condition of BuildRequires: valgrind
+
 * Mon Aug 30 2021 lingsheng <lingsheng@huawei.com> - 1.6-2
 - Support binary strings preserve UTF-8 and UTF-16 errors
 
